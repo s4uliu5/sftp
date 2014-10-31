@@ -8,11 +8,14 @@ import (
 	"flag"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"testing/quick"
 
 	"github.com/kr/fs"
 )
@@ -25,16 +28,17 @@ const (
 )
 
 var testIntegration = flag.Bool("integration", false, "perform integration tests against sftp server process")
+var testSftp = flag.String("sftp", "/usr/lib/openssh/sftp-server", "location of the sftp server binary")
 
 // testClient returns a *Client connected to a localy running sftp-server
 // the *exec.Cmd returned must be defer Wait'd.
-func testClient(t *testing.T, readonly bool) (*Client, *exec.Cmd) {
+func testClient(t testing.TB, readonly bool) (*Client, *exec.Cmd) {
 	if !*testIntegration {
 		t.Skip("skipping intergration test")
 	}
-	cmd := exec.Command("/usr/lib/openssh/sftp-server", "-e", "-R", "-l", debuglevel) // log to stderr, read only
+	cmd := exec.Command(*testSftp, "-e", "-R", "-l", debuglevel) // log to stderr, read only
 	if !readonly {
-		cmd = exec.Command("/usr/lib/openssh/sftp-server", "-e", "-l", debuglevel) // log to stderr
+		cmd = exec.Command(*testSftp, "-e", "-l", debuglevel) // log to stderr
 	}
 	cmd.Stderr = os.Stdout
 	pw, err := cmd.StdinPipe()
@@ -48,10 +52,12 @@ func testClient(t *testing.T, readonly bool) (*Client, *exec.Cmd) {
 	if err := cmd.Start(); err != nil {
 		t.Skipf("could not start sftp-server process: %v", err)
 	}
-	sftp := &Client{
-		w: pw,
-		r: pr,
+
+	sftp, err := NewClientPipe(pr, pw)
+	if err != nil {
+		t.Fatal(err)
 	}
+
 	if err := sftp.sendInit(); err != nil {
 		defer cmd.Wait()
 		t.Fatal(err)
@@ -115,6 +121,24 @@ func TestClientLstatMissing(t *testing.T) {
 	}
 }
 
+func TestClientMkdir(t *testing.T) {
+	sftp, cmd := testClient(t, READWRITE)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	dir, err := ioutil.TempDir("", "sftptest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := path.Join(dir, "mkdir1")
+	if err := sftp.Mkdir(sub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(sub); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientOpen(t *testing.T) {
 	sftp, cmd := testClient(t, READONLY)
 	defer cmd.Wait()
@@ -135,15 +159,87 @@ func TestClientOpen(t *testing.T) {
 	}
 }
 
-var readAtTests = []struct {
-	s    string
-	at   int64
-	want string
-	err  error
-}{
-	{"Hello world!", 6, "world!", nil},
-	{"Hello world!", 0, "Hello world!", nil},
-	{"Hello world!", 12, "", io.EOF},
+const seekBytes = 128 * 1024
+
+type seek struct {
+	offset int64
+}
+
+func (s seek) Generate(r *rand.Rand, _ int) reflect.Value {
+	s.offset = int64(r.Int31n(seekBytes))
+	return reflect.ValueOf(s)
+}
+
+func (s seek) set(t *testing.T, r io.ReadSeeker) {
+	if _, err := r.Seek(s.offset, os.SEEK_SET); err != nil {
+		t.Fatalf("error while seeking with %+v: %v", s, err)
+	}
+}
+
+func (s seek) current(t *testing.T, r io.ReadSeeker) {
+	const mid = seekBytes / 2
+
+	skip := s.offset / 2
+	if s.offset > mid {
+		skip = -skip
+	}
+
+	if _, err := r.Seek(mid, os.SEEK_SET); err != nil {
+		t.Fatalf("error seeking to midpoint with %+v: %v", s, err)
+	}
+	if _, err := r.Seek(skip, os.SEEK_CUR); err != nil {
+		t.Fatalf("error seeking from %d with %+v: %v", mid, s, err)
+	}
+}
+
+func (s seek) end(t *testing.T, r io.ReadSeeker) {
+	if _, err := r.Seek(-s.offset, os.SEEK_END); err != nil {
+		t.Fatalf("error seeking from end with %+v: %v", s, err)
+	}
+}
+
+func TestClientSeek(t *testing.T) {
+	sftp, cmd := testClient(t, READONLY)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	fOS, err := ioutil.TempFile("", "seek-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fOS.Close()
+
+	fSFTP, err := sftp.Open(fOS.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fSFTP.Close()
+
+	writeN(t, fOS, seekBytes)
+
+	if err := quick.CheckEqual(
+		func(s seek) (string, int64) { s.set(t, fOS); return readHash(t, fOS) },
+		func(s seek) (string, int64) { s.set(t, fSFTP); return readHash(t, fSFTP) },
+		nil,
+	); err != nil {
+		t.Errorf("Seek: expected equal absolute seeks: %v", err)
+	}
+
+	if err := quick.CheckEqual(
+		func(s seek) (string, int64) { s.current(t, fOS); return readHash(t, fOS) },
+		func(s seek) (string, int64) { s.current(t, fSFTP); return readHash(t, fSFTP) },
+		nil,
+	); err != nil {
+		t.Errorf("Seek: expected equal seeks from middle: %v", err)
+	}
+
+	if err := quick.CheckEqual(
+		func(s seek) (string, int64) { s.end(t, fOS); return readHash(t, fOS) },
+		func(s seek) (string, int64) { s.end(t, fSFTP); return readHash(t, fSFTP) },
+		nil,
+	); err != nil {
+		t.Errorf("Seek: expected equal seeks from end: %v", err)
+	}
 }
 
 func TestClientCreate(t *testing.T) {
@@ -253,6 +349,23 @@ func TestClientRemove(t *testing.T) {
 	}
 }
 
+func TestClientRemoveDir(t *testing.T) {
+	sftp, cmd := testClient(t, READWRITE)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	dir, err := ioutil.TempDir("", "sftptest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sftp.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
 func TestClientRemoveFailed(t *testing.T) {
 	sftp, cmd := testClient(t, READONLY)
 	defer cmd.Wait()
@@ -287,6 +400,24 @@ func TestClientRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(f2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientReadLine(t *testing.T) {
+	sftp, cmd := testClient(t, READWRITE)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	f, err := ioutil.TempFile("", "sftptest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2 := f.Name() + ".sym"
+	if err := os.Symlink(f.Name(), f2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sftp.ReadLink(f2); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -614,4 +745,154 @@ func TestClientWalk(t *testing.T) {
 	if err := os.RemoveAll(tree.name); err != nil {
 		t.Errorf("removeTree: %v", err)
 	}
+}
+
+func benchmarkRead(b *testing.B, bufsize int) {
+	size := 10*1024*1024 + 123 // ~10MiB
+
+	// open sftp client
+	sftp, cmd := testClient(b, READONLY)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	buf := make([]byte, bufsize)
+
+	b.ResetTimer()
+	b.SetBytes(int64(size))
+
+	for i := 0; i < b.N; i++ {
+		offset := 0
+
+		f2, err := sftp.Open("/dev/zero")
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer f2.Close()
+
+		for offset < size {
+			n, err := io.ReadFull(f2, buf)
+			offset += n
+			if err == io.ErrUnexpectedEOF && offset != size {
+				b.Fatalf("read too few bytes! want: %d, got: %d", size, n)
+			}
+
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			offset += n
+		}
+	}
+}
+
+func BenchmarkRead1k(b *testing.B) {
+	benchmarkRead(b, 1*1024)
+}
+
+func BenchmarkRead16k(b *testing.B) {
+	benchmarkRead(b, 16*1024)
+}
+
+func BenchmarkRead32k(b *testing.B) {
+	benchmarkRead(b, 32*1024)
+}
+
+func BenchmarkRead128k(b *testing.B) {
+	benchmarkRead(b, 128*1024)
+}
+
+func BenchmarkRead512k(b *testing.B) {
+	benchmarkRead(b, 512*1024)
+}
+
+func BenchmarkRead1MiB(b *testing.B) {
+	benchmarkRead(b, 1024*1024)
+}
+
+func BenchmarkRead4MiB(b *testing.B) {
+	benchmarkRead(b, 4*1024*1024)
+}
+
+func benchmarkWrite(b *testing.B, bufsize int) {
+	size := 10*1024*1024 + 123 // ~10MiB
+
+	// open sftp client
+	sftp, cmd := testClient(b, false)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	data := make([]byte, size)
+
+	b.ResetTimer()
+	b.SetBytes(int64(size))
+
+	for i := 0; i < b.N; i++ {
+		offset := 0
+
+		f, err := ioutil.TempFile("", "sftptest")
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+
+		f2, err := sftp.Create(f.Name())
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer f2.Close()
+
+		for offset < size {
+			n, err := f2.Write(data[offset:min(len(data), offset+bufsize)])
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			if offset+n < size && n != bufsize {
+				b.Fatalf("wrote too few bytes! want: %d, got: %d", size, n)
+			}
+
+			offset += n
+		}
+
+		f2.Close()
+
+		fi, err := os.Stat(f.Name())
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if fi.Size() != int64(size) {
+			b.Fatalf("wrong file size: want %d, got %d", size, fi.Size())
+		}
+
+		os.Remove(f.Name())
+	}
+}
+
+func BenchmarkWrite1k(b *testing.B) {
+	benchmarkWrite(b, 1*1024)
+}
+
+func BenchmarkWrite16k(b *testing.B) {
+	benchmarkWrite(b, 16*1024)
+}
+
+func BenchmarkWrite32k(b *testing.B) {
+	benchmarkWrite(b, 32*1024)
+}
+
+func BenchmarkWrite128k(b *testing.B) {
+	benchmarkWrite(b, 128*1024)
+}
+
+func BenchmarkWrite512k(b *testing.B) {
+	benchmarkWrite(b, 512*1024)
+}
+
+func BenchmarkWrite1MiB(b *testing.B) {
+	benchmarkWrite(b, 1024*1024)
+}
+
+func BenchmarkWrite4MiB(b *testing.B) {
+	benchmarkWrite(b, 4*1024*1024)
 }

@@ -165,6 +165,20 @@ func (u *unexpectedIdErr) Error() string {
 	return fmt.Sprintf("sftp: unexpected id: want %v, got %v", u.want, u.got)
 }
 
+func unimplementedSeekWhence(whence int) error {
+	return fmt.Errorf("sftp: unimplemented seek whence %v", whence)
+}
+
+func unexpectedCount(want, got uint32) error {
+	return fmt.Errorf("sftp: unexpected count: want %v, got %v", want, got)
+}
+
+type unexpectedVersionErr struct{ want, got uint32 }
+
+func (u *unexpectedVersionErr) Error() string {
+	return fmt.Sprintf("sftp: unexpected server version: want %v, got %v", u.want, u.got)
+}
+
 type StatusError struct {
 	Code      uint32
 	msg, lang string
